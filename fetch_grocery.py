@@ -5,10 +5,15 @@ Pull grocery stores for the GTA from OpenStreetMap via Overpass.
 Outputs groceries.jsonl with one record per store:
     {id, name, brand, lat, lng, shop, tier}
 
-`tier` is the useful part: "full" means a real grocery shop you could do a
-week's shopping at; "produce" means greengrocers and small health-food shops
-that are great for a top-up but shouldn't be the only thing within walking
-distance. Score them differently.
+`tier` is the useful part, and there are three:
+    "full_service" — a complete shop: fresh produce, dairy, meat, grains.
+                     Matched against FULL_SERVICE_CHAINS, a hand-kept allowlist.
+    "limited"      — sells groceries but is not on the allowlist, so a full
+                     shop is not guaranteed. Independents, corner groceries,
+                     bulk shops, wholesalers.
+    "produce"      — greengrocers and small health-food shops. Fine for a
+                     top-up, not for a weekly run.
+Score them differently.
 
 Deps: pip install requests
 """
@@ -49,14 +54,24 @@ HEADERS = {"User-Agent": "RentMapper/1.0 (grocery data for a rental map)"}
 RETRY_STATUS = {429, 504}
 ATTEMPTS_PER_ENDPOINT = 3
 
-# Chains that are unambiguously a full grocery shop, regardless of how the
-# individual store got tagged. OSM tagging is inconsistent across contributors.
-FULL_CHAINS = re.compile(
-    r"loblaw|no.?frills|metro|sobeys|freshco|food.?basics|zehrs|fortinos|"
-    r"valu.?mart|independent|farm.?boy|longo|whole.?foods|t&t|tnt supermarket|"
-    r"h.?mart|galleria|nations fresh|food.?land|costco|walmart|real canadian|"
-    r"superstore|bulk barn|adonis|highland farms|coppa|organic garage|"
-    r"rabba|summerhill market|fiesta farms|sunny food|oceans fresh",
+# The full-service allowlist, supplied by hand. This is deliberately a closed
+# list rather than a rule over OSM tags: shop=supermarket turned out to cover
+# everything from Loblaws to a bulk-bin shop, so nothing is promoted here
+# unless it is named. Patterns are matched against name + brand.
+FULL_SERVICE_CHAINS = re.compile(
+    r"loblaw|metro|food.?basics|longo|farm.?boy|bestco|blue sky|bruno|"
+    r"btrust|c&c|freshco|costco|city\s?market|fiesta farms|food.?land|"
+    r"fortinos|galleria|healthy planet|march[eé]\s*leo|no.?frills|"
+    r"p\.a\.t|rabba|real canadian|superstore|sobeys|summerhill market|"
+    r"walmart|whole foods market|independent|t&t",
+    re.I,
+)
+
+# shop=wholesale is a catch-all in OSM — it pulls in tool warehouses, surplus
+# stores and range-hood suppliers. Keep only the ones that are plausibly food.
+FOOD_WHOLESALE = re.compile(
+    r"costco|wholesale club|restaurant depot|cash.?(&|and).?carry|food|"
+    r"grocer|market|produce|meat|halal|fruit|farm",
     re.I,
 )
 
@@ -92,13 +107,23 @@ def coords(el):
     return None
 
 
+def is_food_wholesale(tags):
+    """shop=wholesale needs a name check before we believe it sells groceries."""
+    if tags.get("shop") != "wholesale":
+        return True
+    return bool(FOOD_WHOLESALE.search(f"{tags.get('name', '')} {tags.get('brand', '')}"))
+
+
 def classify(tags):
     name = f"{tags.get('name', '')} {tags.get('brand', '')}"
     shop = tags.get("shop", "")
-    if FULL_CHAINS.search(name):
-        return "full"
+
+    if FULL_SERVICE_CHAINS.search(name):
+        return "full_service"
     if shop in ("supermarket", "wholesale", "department_store", "grocery"):
-        return "full"
+        # Sells groceries, but not on the allowlist — an independent, a corner
+        # grocery or a warehouse. Real, just not a guaranteed weekly shop.
+        return "limited"
     return "produce"  # greengrocer, health_food, and unbranded odds and ends
 
 
@@ -134,12 +159,16 @@ def main():
 
     stores = []
     skipped_nocoord = 0
+    skipped_nonfood = 0
     for el in elements:
         c = coords(el)
         if not c:
             skipped_nocoord += 1
             continue
         tags = el.get("tags", {})
+        if not is_food_wholesale(tags):
+            skipped_nonfood += 1
+            continue
         stores.append({
             "id": f"{el['type']}/{el['id']}",
             "name": tags.get("name") or tags.get("brand") or "(unnamed)",
@@ -157,12 +186,15 @@ def main():
         for s in stores:
             f.write(json.dumps(s) + "\n")
 
-    full = sum(1 for s in stores if s["tier"] == "full")
+    tiers = {t: sum(1 for s in stores if s["tier"] == t)
+             for t in ("full_service", "limited", "produce")}
     unnamed = sum(1 for s in stores if s["name"] == "(unnamed)")
     print(f"\n{len(stores)} stores after dedupe ({before - len(stores)} duplicates "
-          f"removed, {skipped_nocoord} without coordinates)", file=sys.stderr)
-    print(f"  full grocery: {full}", file=sys.stderr)
-    print(f"  produce/small: {len(stores) - full}", file=sys.stderr)
+          f"removed, {skipped_nocoord} without coordinates, "
+          f"{skipped_nonfood} non-food wholesale)", file=sys.stderr)
+    print(f"  full service:  {tiers['full_service']}", file=sys.stderr)
+    print(f"  limited:       {tiers['limited']}", file=sys.stderr)
+    print(f"  produce/small: {tiers['produce']}", file=sys.stderr)
     print(f"  unnamed: {unnamed}", file=sys.stderr)
     print("\n-> groceries.jsonl", file=sys.stderr)
 

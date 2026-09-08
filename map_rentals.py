@@ -211,6 +211,15 @@ HTML = """<!doctype html>
 <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
 <script>
 const LISTINGS = __DATA__;
+const GROCERIES = __GROCERIES__;
+
+// Three tiers, because "there is a grocery store nearby" means very different
+// things: a weekly shop, a partial shop, or just a top-up.
+const GROCERY_TIERS = {
+  full_service: { emoji: "🛒", label: "Full service (produce, dairy, meat)" },
+  limited:      { emoji: "🥫", label: "Limited selection" },
+  produce:      { emoji: "🥬", label: "Produce / small" }
+};
 
 // Rent buckets drive both the pin colour and the legend.
 const BUCKETS = [
@@ -282,6 +291,38 @@ const markers = LISTINGS.map(l => {
   return m;
 });
 
+// Groceries get their own cluster so 900-odd pins stay legible when zoomed out,
+// and never merge into the rent clusters.
+const groceryCluster = L.markerClusterGroup({
+  chunkedLoading: true,
+  disableClusteringAtZoom: 15,
+  maxClusterRadius: 45,
+  iconCreateFunction: c => L.divIcon({
+    html: '<div class="gcluster">' + c.getChildCount() + "</div>",
+    className: "", iconSize: [30, 30]
+  })
+});
+
+groceryCluster.addLayers(GROCERIES.map(g => {
+  const tier = GROCERY_TIERS[g.tier] || GROCERY_TIERS.limited;
+  const m = L.marker([g.lat, g.lng], {
+    icon: L.divIcon({
+      html: '<div class="gpin">' + tier.emoji + "</div>",
+      className: "", iconSize: [22, 22], iconAnchor: [11, 11], popupAnchor: [0, -11]
+    }),
+    // Keep grocery pins under the listings, which are the point of the map.
+    zIndexOffset: -500
+  });
+  const osm = g.id ? "https://www.openstreetmap.org/" + g.id : "";
+  m.bindPopup('<div class="pop-title">' + esc(g.name) + "</div>" +
+    '<div class="pop-meta">' + tier.label +
+      (g.shop ? " &middot; " + esc(g.shop.replace(/_/g, " ")) : "") + "</div>" +
+    (osm ? '<div class="pop-meta"><a href="' + osm + '" target="_blank" rel="noopener">OpenStreetMap &rarr;</a></div>' : ""),
+    { maxWidth: 260 });
+  m.bindTooltip(tier.emoji + " " + esc(g.name), { direction: "top" });
+  return m;
+}));
+
 const $ = id => document.getElementById(id);
 
 function apply() {
@@ -306,16 +347,22 @@ function apply() {
   cluster.clearLayers();
   cluster.addLayers(keep);
   $("shown").textContent = keep.length.toLocaleString();
+
+  if ($("groc").checked) map.addLayer(groceryCluster);
+  else map.removeLayer(groceryCluster);
 }
 
-["rent", "beds", "type", "now"].forEach(id => {
+["rent", "beds", "type", "now", "groc"].forEach(id => {
   $(id).addEventListener("input", apply);
   $(id).addEventListener("change", apply);
 });
 
 $("legend").innerHTML = BUCKETS
   .map(b => '<div><span class="dot" style="background:' + b.color + '"></span>' + b.label + "</div>")
-  .join("") + '<div><span class="dot" style="background:' + GREY + '"></span>Price n/a</div>';
+  .join("") + '<div><span class="dot" style="background:' + GREY + '"></span>Price n/a</div>' +
+  Object.values(GROCERY_TIERS)
+    .map(t => '<div><span style="width:12px;text-align:center">' + t.emoji + "</span>" + t.label + "</div>")
+    .join("");
 
 apply();
 map.fitBounds(L.latLngBounds(LISTINGS.map(l => [l.lat, l.lon])), { padding: [30, 30] });
@@ -325,7 +372,7 @@ map.fitBounds(L.latLngBounds(LISTINGS.map(l => [l.lat, l.lon])), { padding: [30,
 """
 
 
-def render(rows, title):
+def render(rows, title, groceries=()):
     rents = sorted(r["rent"] for r in rows if r["rent"] is not None)
     if rents:
         rent_min = int(rents[0] // 100 * 100)
@@ -344,6 +391,9 @@ def render(rows, title):
 
     out = HTML
     out = out.replace("__DATA__", data)
+    out = out.replace("__GROCERIES__",
+                      json.dumps(list(groceries), separators=(",", ":"), ensure_ascii=False))
+    out = out.replace("__GROCERY_COUNT__", "{:,}".format(len(groceries)))
     out = out.replace("__TITLE__", title)
     out = out.replace("__COUNT__", "{:,}".format(len(rows)))
     out = out.replace("__RENT_MIN__", str(rent_min))
@@ -360,14 +410,20 @@ def main():
     if not rows:
         sys.exit("No mappable listings found in {}.".format(path))
 
+    groceries = load_groceries(args.groceries)
+
     title = os.path.splitext(os.path.basename(path))[0].replace("-", " ").title()
-    html = render(rows, title)
+    html = render(rows, title, groceries)
 
     with open(args.output, "w", encoding="utf-8") as fh:
         fh.write(html)
 
     print("Read      {}  ({:,} lines)".format(path, stats["lines"]))
     print("Mapped    {:,} listings".format(len(rows)))
+    if groceries:
+        print("Mapped    {:,} grocery stores from {}".format(len(groceries), args.groceries))
+    else:
+        print("Skipped   groceries ({} not found)".format(args.groceries))
     if stats["no_location"]:
         print("Skipped   {:,} without usable coordinates".format(stats["no_location"]))
     if stats["bad_json"]:
