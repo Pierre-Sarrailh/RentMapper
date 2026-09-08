@@ -25,6 +25,9 @@ def parse_args():
                    help="rentals .jsonl file (default: newest rentals-*.jsonl here)")
     p.add_argument("-o", "--output", default="rentals_map.html",
                    help="output HTML file (default: rentals_map.html)")
+    p.add_argument("-g", "--groceries", default="groceries.jsonl",
+                   help="grocery .jsonl from fetch_grocery.py (default: groceries.jsonl); "
+                        "skipped silently if missing")
     p.add_argument("--open", action="store_true",
                    help="open the map in the default browser when done")
     return p.parse_args()
@@ -112,6 +115,35 @@ def load_listings(path):
     return rows, stats
 
 
+def load_groceries(path):
+    """Parse groceries.jsonl. Missing file is fine — the layer is optional."""
+    if not path or not os.path.exists(path):
+        return []
+
+    rows = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            lat, lng = num(rec.get("lat")), num(rec.get("lng"))
+            if lat is None or lng is None:
+                continue
+            rows.append({
+                "id": rec.get("id") or "",
+                "name": rec.get("name") or "(unnamed)",
+                "lat": lat,
+                "lng": lng,
+                "shop": rec.get("shop") or "",
+                "tier": rec.get("tier") or "produce",
+            })
+    return rows
+
+
 HTML = """<!doctype html>
 <html>
 <head>
@@ -138,6 +170,16 @@ HTML = """<!doctype html>
   .legend div { display: flex; align-items: center; gap: 7px; font-size: 12px; margin: 3px 0; }
   .dot { width: 12px; height: 12px; border-radius: 50%; border: 1px solid rgba(0,0,0,.35); }
   .pin { border-radius: 50%; border: 1.5px solid rgba(255,255,255,.9); box-shadow: 0 0 3px rgba(0,0,0,.5); }
+  /* Emoji sits in a white puck so it stays readable over any tile colour. */
+  .gpin {
+    width: 22px; height: 22px; border-radius: 50%; background: rgba(255,255,255,.95);
+    box-shadow: 0 0 3px rgba(0,0,0,.45); text-align: center; line-height: 22px; font-size: 13px;
+  }
+  .gcluster {
+    width: 30px; height: 30px; border-radius: 50%; background: rgba(26,107,60,.88);
+    color: #fff; text-align: center; line-height: 30px; font-size: 12px; font-weight: 600;
+    box-shadow: 0 0 4px rgba(0,0,0,.4);
+  }
   .leaflet-popup-content { margin: 10px 12px; }
   .pop-title { font-weight: 600; margin-bottom: 4px; }
   .pop-rent { font-size: 17px; font-weight: 700; color: #1a6b3c; }
@@ -160,6 +202,7 @@ HTML = """<!doctype html>
   <select id="type"><option value="">All types</option>__TYPE_OPTIONS__</select>
 
   <label><input type="checkbox" id="now"> Available now only</label>
+  <label><input type="checkbox" id="groc" checked> Grocery stores (__GROCERY_COUNT__)</label>
 
   <div class="legend" id="legend"></div>
 </div>

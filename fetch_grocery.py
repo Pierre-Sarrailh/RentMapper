@@ -40,6 +40,15 @@ ENDPOINTS = [
     "https://overpass.kumi.systems/api/interpreter",  # mirror, if the main one is busy
 ]
 
+# overpass-api.de answers 406 to the default python-requests User-Agent, so this
+# is not optional. Identifying the tool is also what the Overpass usage policy asks for.
+HEADERS = {"User-Agent": "RentMapper/1.0 (grocery data for a rental map)"}
+
+# 429 = over the per-IP rate limit, 504 = the server is at capacity. Both mean
+# "come back shortly", so they are worth a retry rather than a hard failure.
+RETRY_STATUS = {429, 504}
+ATTEMPTS_PER_ENDPOINT = 3
+
 # Chains that are unambiguously a full grocery shop, regardless of how the
 # individual store got tagged. OSM tagging is inconsistent across contributors.
 FULL_CHAINS = re.compile(
@@ -54,18 +63,24 @@ FULL_CHAINS = re.compile(
 
 def fetch():
     for url in ENDPOINTS:
-        try:
-            print(f"querying {url} ...", file=sys.stderr)
-            r = requests.post(url, data={"data": QUERY}, timeout=300)
-            if r.status_code == 429 or r.status_code == 504:
-                print(f"  busy ({r.status_code}), trying next mirror", file=sys.stderr)
-                time.sleep(5)
+        for attempt in range(1, ATTEMPTS_PER_ENDPOINT + 1):
+            print(f"querying {url} (attempt {attempt}) ...", file=sys.stderr)
+            try:
+                r = requests.post(url, data={"data": QUERY}, headers=HEADERS, timeout=300)
+            except requests.RequestException as e:
+                print(f"  network error: {e}", file=sys.stderr)
+                break  # a dead connection will not fix itself; move to the mirror
+            if r.status_code in RETRY_STATUS:
+                wait = 5 * attempt  # back off a little further each time
+                print(f"  busy ({r.status_code}), retrying in {wait}s", file=sys.stderr)
+                time.sleep(wait)
                 continue
-            r.raise_for_status()
+            if not r.ok:
+                # Overpass explains query errors in the body; the status alone is not enough.
+                print(f"  HTTP {r.status_code}: {r.text[:300].strip()}", file=sys.stderr)
+                break
             return r.json()["elements"]
-        except requests.RequestException as e:
-            print(f"  failed: {e}", file=sys.stderr)
-    sys.exit("all Overpass endpoints failed — wait a minute and retry")
+    sys.exit("all Overpass endpoints failed — see the errors above")
 
 
 def coords(el):
