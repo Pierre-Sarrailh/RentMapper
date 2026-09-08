@@ -34,7 +34,6 @@ import os
 import re
 import statistics
 import sys
-import time
 import zipfile
 from datetime import date, timedelta
 
