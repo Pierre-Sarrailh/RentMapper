@@ -19,12 +19,13 @@ Deps: pip install requests
 """
 
 import json
-import math
 import re
 import sys
 import time
 
 import requests
+
+from geo import haversine_m
 
 # South, West, North, East — Overpass order. Covers Toronto plus the inner GTA,
 # matching the spread of the rentals data.
@@ -125,15 +126,6 @@ def classify(tags):
         # grocery or a warehouse. Real, just not a guaranteed weekly shop.
         return "limited"
     return "produce"  # greengrocer, health_food, and unbranded odds and ends
-
-
-def haversine_m(a, b):
-    R = 6371000
-    p1, p2 = math.radians(a[0]), math.radians(b[0])
-    dp = p2 - p1
-    dl = math.radians(b[1] - a[1])
-    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return 2 * R * math.asin(math.sqrt(h))
 
 
 def dedupe(stores, radius_m=60):

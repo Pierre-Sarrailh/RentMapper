@@ -4,8 +4,14 @@
 Produces a single self-contained HTML file (Leaflet + marker clustering, loaded
 from CDN) with no third-party Python dependencies.
 
+Pulls in two optional side inputs when they exist:
+  * groceries.jsonl   from fetch_grocery.py — the store layer, and the walking
+                      distance from each listing to the nearest full-service shop
+  * commute-*.json    from commute.py — transit minutes from each listing to an
+                      office address
+
 Usage:
-    python3 map_rentals.py                          # auto-discovers rentals-*.jsonl
+    python3 map_rentals.py                          # auto-discovers everything
     python3 map_rentals.py rentals-toronto.jsonl -o map.html
 """
 
@@ -14,6 +20,8 @@ import glob
 import json
 import os
 import sys
+
+from geo import GridIndex
 
 LISTING_URL = "https://rentals.ca/{path}"
 
@@ -25,6 +33,9 @@ def parse_args():
                    help="rentals .jsonl file (default: newest rentals-*.jsonl here)")
     p.add_argument("-o", "--output", default="rentals_map.html",
                    help="output HTML file (default: rentals_map.html)")
+    p.add_argument("-c", "--commute",
+                   help="commute JSON from commute.py (default: newest "
+                        "commute-*.json here); skipped silently if missing")
     p.add_argument("-g", "--groceries", default="groceries.jsonl",
                    help="grocery .jsonl from fetch_grocery.py (default: groceries.jsonl); "
                         "skipped silently if missing")
@@ -93,6 +104,7 @@ def load_listings(path):
             available_now = any((p.get("availability") or {}).get("now") for p in plans)
 
             rows.append({
+                "id": rec.get("id"),
                 "lat": lat,
                 "lon": lon,
                 "name": rec.get("name") or addr.get("street") or "Listing",
@@ -110,6 +122,9 @@ def load_listings(path):
                 "parking": parking,
                 "now": available_now,
                 "url": LISTING_URL.format(path=rec["path"]) if rec.get("path") else "",
+                "groc_m": None,     # filled by attach_grocery_distance()
+                "groc_name": "",
+                "commute": None,    # filled by attach_commute()
             })
 
     return rows, stats
@@ -144,6 +159,50 @@ def load_groceries(path):
     return rows
 
 
+def attach_grocery_distance(rows, groceries, radius_m=5000):
+    """Distance from each listing to the nearest full-service grocery store.
+
+    Straight-line, matching the "within 1 km" framing of the filter. Only
+    full_service counts — a greengrocer down the street does not make a listing
+    walkable to a weekly shop.
+    """
+    full = [g for g in groceries if g["tier"] == "full_service"]
+    if not full:
+        return 0
+    index = GridIndex(((g["lat"], g["lng"], g) for g in full), cell_m=1000)
+    matched = 0
+    for r in rows:
+        dist, store = index.nearest(r["lat"], r["lon"], radius_m)
+        if store:
+            r["groc_m"] = round(dist)
+            r["groc_name"] = store["name"]
+            matched += 1
+    return matched
+
+
+def find_commute(explicit):
+    if explicit:
+        return explicit
+    matches = sorted(glob.glob("commute-*.json"), key=os.path.getmtime, reverse=True)
+    return matches[0] if matches else None
+
+
+def attach_commute(rows, path):
+    """Merge commute.py's output in by listing id. Returns (office, matched)."""
+    if not path or not os.path.exists(path):
+        return None, 0
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    minutes = data.get("minutes") or {}
+    matched = 0
+    for r in rows:
+        m = minutes.get(r["id"])
+        if m is not None:
+            r["commute"] = m
+            matched += 1
+    return data.get("office"), matched
+
+
 HTML = """<!doctype html>
 <html>
 <head>
@@ -163,6 +222,11 @@ HTML = """<!doctype html>
   }
   .panel h2 { margin: 0 0 2px; font-size: 15px; }
   .panel .sub { color: #666; font-size: 12px; margin-bottom: 10px; }
+  .group { margin-top: 12px; border-top: 1px solid #e3e3e3; padding-top: 4px; }
+  .group-h { font-size: 11px; font-weight: 700; text-transform: uppercase;
+             letter-spacing: .04em; color: #888; margin-top: 6px; }
+  .hint { font-size: 11px; color: #777; margin-top: 5px; line-height: 1.35; }
+  .near { color: #b06000; }
   .panel label { display: block; font-size: 12px; font-weight: 600; margin: 10px 0 3px; }
   .panel select, .panel input[type=range] { width: 100%; box-sizing: border-box; }
   .val { font-weight: 400; color: #666; }
@@ -174,6 +238,11 @@ HTML = """<!doctype html>
   .gpin {
     width: 22px; height: 22px; border-radius: 50%; background: rgba(255,255,255,.95);
     box-shadow: 0 0 3px rgba(0,0,0,.45); text-align: center; line-height: 22px; font-size: 13px;
+  }
+  .office {
+    width: 30px; height: 30px; border-radius: 50%; background: #1a3d6b;
+    text-align: center; line-height: 30px; font-size: 16px;
+    box-shadow: 0 0 0 3px rgba(255,255,255,.9), 0 1px 6px rgba(0,0,0,.5);
   }
   .gcluster {
     width: 30px; height: 30px; border-radius: 50%; background: rgba(26,107,60,.88);
@@ -190,13 +259,31 @@ HTML = """<!doctype html>
 <div id="map"></div>
 <div class="panel">
   <h2>__TITLE__</h2>
-  <div class="sub"><span id="shown">0</span> of __COUNT__ listings</div>
+  <div class="sub"><span id="shown">0</span> of __COUNT__ listings<br>
+    <span class="near" id="nearNote"></span></div>
 
   <label>Max rent <span class="val" id="rentVal"></span></label>
   <input type="range" id="rent" min="__RENT_MIN__" max="__RENT_MAX__" step="100" value="__RENT_MAX__">
 
   <label>Min bedrooms <span class="val" id="bedVal">any</span></label>
   <input type="range" id="beds" min="0" max="5" step="1" value="0">
+
+  <label>Min bathrooms <span class="val" id="bathVal">any</span></label>
+  <input type="range" id="baths" min="0" max="4" step="1" value="0">
+
+  <div class="group">
+    <div class="group-h">Walk &amp; commute</div>
+
+    <label>Max commute <span class="val" id="commuteVal"></span></label>
+    <input type="range" id="commute" min="10" max="90" step="5" value="30">
+
+    <label>Max walk to groceries <span class="val" id="grocVal"></span></label>
+    <input type="range" id="grocDist" min="250" max="3000" step="50" value="1000">
+
+    <label>Slack <span class="val" id="slackVal"></span></label>
+    <input type="range" id="slack" min="0" max="100" step="5" value="25">
+    <div class="hint" id="slackHint"></div>
+  </div>
 
   <label>Property type</label>
   <select id="type"><option value="">All types</option>__TYPE_OPTIONS__</select>
@@ -212,6 +299,33 @@ HTML = """<!doctype html>
 <script>
 const LISTINGS = __DATA__;
 const GROCERIES = __GROCERIES__;
+const OFFICE = __OFFICE__;
+
+// Sliders at the top of their range mean "no limit" rather than a literal value;
+// 90 minutes and 3 km are already past the point of caring.
+const NO_COMMUTE_LIMIT = 90, NO_GROC_LIMIT = 3000;
+
+// Either side input is optional. Without it every listing scores null on that
+// axis, so an enabled limit would hide the entire map — pin the control open.
+const HAS_COMMUTE = LISTINGS.some(l => l.commute !== null);
+const HAS_GROC = LISTINGS.some(l => l.groc_m !== null);
+
+// Overshoot budget. Each target contributes how far past it a listing sits, as a
+// fraction of that target. Beating a target earns nothing, it just costs nothing.
+// A listing qualifies while its total overshoot fits inside the slack budget, so
+// 1.1 km from a shop (0.10 over) clears a 0.25 budget but 1.4 km (0.40) does not.
+function overshoot(l, commuteMax, grocMax) {
+  let over = 0;
+  if (commuteMax !== null) {
+    if (l.commute === null) return Infinity;  // unreachable by transit
+    over += Math.max(0, l.commute / commuteMax - 1);
+  }
+  if (grocMax !== null) {
+    if (l.groc_m === null) return Infinity;
+    over += Math.max(0, l.groc_m / grocMax - 1);
+  }
+  return over;
+}
 
 // Three tiers, because "there is a grocery store nearby" means very different
 // things: a weekly shop, a partial shop, or just a top-up.
@@ -237,6 +351,8 @@ function colorFor(rent) {
 }
 
 const money = n => n === null ? "n/a" : "$" + n.toLocaleString();
+const distText = m => m < 1000 ? Math.round(m / 10) * 10 + " m"
+                               : (m / 1000).toFixed(1) + " km";
 
 function rentText(l) {
   if (l.rent === null) return "Price n/a";
@@ -255,6 +371,14 @@ function popup(l) {
          '<div class="pop-rent">' + rentText(l) + "</div>" +
          '<div class="pop-meta">' + bits.join(" &middot; ") + "</div>" +
          (where ? '<div class="pop-meta">' + esc(where) + "</div>" : "") +
+         (l.commute !== null
+            ? '<div class="pop-meta">\U0001F687 ' + Math.round(l.commute) +
+              " min to " + esc(OFFICE ? OFFICE.label : "office") + "</div>"
+            : (OFFICE ? '<div class="pop-meta">\U0001F687 no transit route found</div>' : "")) +
+         (l.groc_m !== null
+            ? '<div class="pop-meta">\U0001F6D2 ' + distText(l.groc_m) + " to " +
+              esc(l.groc_name) + "</div>"
+            : "") +
          '<div class="pop-meta">' + esc(l.type.replace(/_/g, " ")) +
            (l.now ? " &middot; available now" : "") + "</div>" +
          (l.url ? '<div class="pop-meta"><a href="' + esc(l.url) + '" target="_blank" rel="noopener">View listing &rarr;</a></div>' : "");
@@ -323,36 +447,88 @@ groceryCluster.addLayers(GROCERIES.map(g => {
   return m;
 }));
 
+if (OFFICE) {
+  L.marker([OFFICE.lat, OFFICE.lng], {
+    icon: L.divIcon({
+      html: '<div class="office">\U0001F3E2</div>',
+      className: "", iconSize: [30, 30], iconAnchor: [15, 15], popupAnchor: [0, -15]
+    }),
+    zIndexOffset: 1000
+  }).addTo(map).bindTooltip(esc(OFFICE.label), { direction: "top" });
+}
+
 const $ = id => document.getElementById(id);
+
+for (const [id, ok, limit, why] of [
+  ["commute", HAS_COMMUTE, NO_COMMUTE_LIMIT, "run commute.py to enable"],
+  ["grocDist", HAS_GROC, NO_GROC_LIMIT, "run fetch_grocery.py to enable"]
+]) {
+  if (!ok) {
+    $(id).value = limit;
+    $(id).disabled = true;
+    $(id).title = why;
+  }
+}
 
 function apply() {
   const maxRent = +$("rent").value;
   const atMax = maxRent >= +$("rent").max;
   const minBeds = +$("beds").value;
+  const minBaths = +$("baths").value;
   const type = $("type").value;
   const nowOnly = $("now").checked;
 
+  const commuteRaw = +$("commute").value;
+  const grocRaw = +$("grocDist").value;
+  const commuteMax = commuteRaw >= NO_COMMUTE_LIMIT ? null : commuteRaw;
+  const grocMax = grocRaw >= NO_GROC_LIMIT ? null : grocRaw;
+  const slack = +$("slack").value / 100;
+
   $("rentVal").textContent = atMax ? "any" : "<= " + money(maxRent);
   $("bedVal").textContent = minBeds === 0 ? "any" : minBeds + "+";
+  $("bathVal").textContent = minBaths === 0 ? "any" : minBaths + "+";
+  $("commuteVal").textContent = !HAS_COMMUTE ? "no data"
+    : commuteMax === null ? "any" : commuteMax + " min";
+  $("grocVal").textContent = !HAS_GROC ? "no data"
+    : grocMax === null ? "any" : distText(grocMax);
+  $("slackVal").textContent = slack === 0 ? "strict" : "+" + Math.round(slack * 100) + "%";
+  $("slackHint").textContent = slack === 0
+    ? "Both limits are hard."
+    : "A listing may exceed the limits by " + Math.round(slack * 100) +
+      "% in total and still qualify.";
 
+  let near = 0;
   const keep = markers.filter(m => {
     const l = m.listing;
     if (!atMax && (l.rent === null || l.rent > maxRent)) return false;
     if (minBeds && (l.beds === null || l.beds < minBeds)) return false;
+    if (minBaths && (l.baths === null || l.baths < minBaths)) return false;
     if (type && l.type !== type) return false;
     if (nowOnly && !l.now) return false;
+
+    const over = overshoot(l, commuteMax, grocMax);
+    if (over > slack) return false;
+    // Dim the ones that only qualified on slack, so a near-miss reads as one.
+    const isNear = over > 0;
+    if (isNear) near++;
+    m.setStyle(isNear ? { fillOpacity: .3, opacity: .45 }
+                      : { fillOpacity: .85, opacity: .9 });
     return true;
   });
 
   cluster.clearLayers();
   cluster.addLayers(keep);
   $("shown").textContent = keep.length.toLocaleString();
+  $("nearNote").textContent = near
+    ? near.toLocaleString() + " of them just outside the limits"
+    : "";
 
   if ($("groc").checked) map.addLayer(groceryCluster);
   else map.removeLayer(groceryCluster);
 }
 
-["rent", "beds", "type", "now", "groc"].forEach(id => {
+["rent", "beds", "baths", "commute", "grocDist", "slack",
+ "type", "now", "groc"].forEach(id => {
   $(id).addEventListener("input", apply);
   $(id).addEventListener("change", apply);
 });
@@ -372,7 +548,7 @@ map.fitBounds(L.latLngBounds(LISTINGS.map(l => [l.lat, l.lon])), { padding: [30,
 """
 
 
-def render(rows, title, groceries=()):
+def render(rows, title, groceries=(), office=None):
     rents = sorted(r["rent"] for r in rows if r["rent"] is not None)
     if rents:
         rent_min = int(rents[0] // 100 * 100)
@@ -394,6 +570,7 @@ def render(rows, title, groceries=()):
     out = out.replace("__GROCERIES__",
                       json.dumps(list(groceries), separators=(",", ":"), ensure_ascii=False))
     out = out.replace("__GROCERY_COUNT__", "{:,}".format(len(groceries)))
+    out = out.replace("__OFFICE__", json.dumps(office) if office else "null")
     out = out.replace("__TITLE__", title)
     out = out.replace("__COUNT__", "{:,}".format(len(rows)))
     out = out.replace("__RENT_MIN__", str(rent_min))
@@ -411,9 +588,13 @@ def main():
         sys.exit("No mappable listings found in {}.".format(path))
 
     groceries = load_groceries(args.groceries)
+    with_groc = attach_grocery_distance(rows, groceries)
+
+    commute_path = find_commute(args.commute)
+    office, with_commute = attach_commute(rows, commute_path)
 
     title = os.path.splitext(os.path.basename(path))[0].replace("-", " ").title()
-    html = render(rows, title, groceries)
+    html = render(rows, title, groceries, office)
 
     with open(args.output, "w", encoding="utf-8") as fh:
         fh.write(html)
@@ -421,9 +602,19 @@ def main():
     print("Read      {}  ({:,} lines)".format(path, stats["lines"]))
     print("Mapped    {:,} listings".format(len(rows)))
     if groceries:
-        print("Mapped    {:,} grocery stores from {}".format(len(groceries), args.groceries))
+        full = sum(1 for g in groceries if g["tier"] == "full_service")
+        print("Mapped    {:,} grocery stores from {} ({:,} full service)".format(
+            len(groceries), args.groceries, full))
+        print("Measured  {:,} listings to their nearest full-service store".format(with_groc))
     else:
         print("Skipped   groceries ({} not found)".format(args.groceries))
+    if commute_path:
+        print("Joined    {:,} commute times from {}".format(with_commute, commute_path))
+        if with_commute < len(rows):
+            print("          {:,} listings have no transit route within range".format(
+                len(rows) - with_commute))
+    else:
+        print("Skipped   commute times (no commute-*.json — run commute.py)")
     if stats["no_location"]:
         print("Skipped   {:,} without usable coordinates".format(stats["no_location"]))
     if stats["bad_json"]:
